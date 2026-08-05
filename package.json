@@ -1,0 +1,16 @@
+{
+  "name": "worktree-patrol",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "本机 git worktree 风险巡检与治理(个人机器卫生工具)",
+  "scripts": {
+    "repo:worktrees": "node scripts/repo-worktrees.mjs",
+    "patrol:hook": "node scripts/worktree-patrol.mjs hook",
+    "patrol:report": "node scripts/worktree-patrol.mjs report",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+# 巡检运行态(基线快照/pending/锁):本机状态,不入库
+state/
+_tmp/
+.DS_Store
