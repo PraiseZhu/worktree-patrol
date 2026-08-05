@@ -57,7 +57,7 @@ const GH_PR_LIMIT = 200;
 // GIT_INDEX_FILE/GIT_COMMON_DIR 会让 `git -C <path>` 静默串到另一个 checkout——
 // 探针名义上在查 worktree A,实际读的是环境指定的 B,得出 A 的假状态(R1 席②实测)。
 // 删掉它们后 `-C <path>` 是唯一的仓库定位来源。
-const GIT_ENV = (() => {
+export const GIT_ENV = (() => {
   const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
   for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM']) {
     delete env[k];
@@ -75,7 +75,7 @@ const GIT_ENV = (() => {
 })();
 // gh 环境:清掉仓库定位变量,配合显式 --repo(见 resolveRepoSlug)。
 // 保留 GH_TOKEN/GH_HOST 等认证类变量——它们决定「能不能查」,不决定「查哪个仓」。
-const GH_ENV = (() => {
+export const GH_ENV = (() => {
   const env = { ...GIT_ENV };
   for (const k of ['GH_REPO', 'GITHUB_REPOSITORY']) delete env[k];
   return env;
@@ -111,7 +111,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-function git(args, options = {}) {
+export function git(args, options = {}) {
   return execFileSync('git', args, {
     cwd: options.cwd,
     encoding: 'utf8',
@@ -120,7 +120,7 @@ function git(args, options = {}) {
   }).trimEnd();
 }
 
-function tryGit(args, options = {}) {
+export function tryGit(args, options = {}) {
   try {
     return git(args, { ...options, allowFailure: true });
   } catch {
@@ -194,7 +194,7 @@ function runGh(root, state, repoSlug) {
 
 // PR 查询:成功返回 {status:'ok', map};任何失败返回 {status:'degraded', reason}。
 // 消费方必须区分「确认没有 PR」与「没查成」——后者所有依赖 PR 的判定 fail-closed。
-function loadPrLookup(root, repoSlug) {
+export function loadPrLookup(root, repoSlug) {
   // 不知道目标仓就不查:cwd 推断 + GH_REPO 继承会让 PR 数据来自另一个仓
   // (R2 CV2-R2-001 实测:数据来自 PraiseZhu/Review-PR 却仍报 removable=true)。
   if (!repoSlug) {
@@ -246,6 +246,12 @@ function loadPrLookup(root, repoSlug) {
     return { status: 'degraded', reason: 'gh-bad-row', map: new Map(), historyTruncated: false };
   }
   const map = new Map();
+  // 在途 PR 的两个索引(建账策略消费):
+  //  - openHeadRefNames 排除 cross-repo(fork 的分支名在对方仓,与本地分支不对应);
+  //  - openHeadOids **包含** cross-repo(OID 是全仓对象空间,本地 detached checkout
+  //    到 fork PR 的 head 时必须能命中,否则在审 PR 被误判无关联)。
+  const openHeadRefNames = [];
+  const openHeadOids = [];
   const consider = (row) => {
     // fork PR 的 headRefName 是对方仓库里的分支名,与本地分支不对应,入表会误关联。
     if (row.isCrossRepository) return;
@@ -262,9 +268,13 @@ function loadPrLookup(root, repoSlug) {
   };
   // open 单独拉一遍先入表:--state all 的 limit 作用在全历史,PR 总数超 limit 时
   // 老而仍 open 的 PR 会被挤出;open 专查保证在途 PR 不丢。
-  for (const row of openRows) consider(row);
+  for (const row of openRows) {
+    consider(row);
+    if (!row.isCrossRepository) openHeadRefNames.push(row.headRefName);
+    if (typeof row.headRefOid === 'string' && row.headRefOid) openHeadOids.push(row.headRefOid);
+  }
   for (const row of allRows) consider(row);
-  return { status: 'ok', reason: null, map, historyTruncated };
+  return { status: 'ok', reason: null, map, historyTruncated, openHeadRefNames, openHeadOids };
 }
 
 function buildRow(entry, base, prLookup) {
