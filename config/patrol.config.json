@@ -7,5 +7,5 @@
   ],
   "residueMaxBytes": 2147483648,
   "lsofBin": "/usr/sbin/lsof",
-  "lsofTimeoutMs": 10000
+  "lsofTimeoutMs": 30000
 }

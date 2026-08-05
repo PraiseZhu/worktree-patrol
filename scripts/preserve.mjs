@@ -184,8 +184,12 @@ function residueArchive(worktreePath, ignoredPaths, destDir, residueMaxBytes) {
     const abs = join(worktreePath, rel);
     const stat = lstatSync(abs);
     if (stat.isSymbolicLink()) files.push({ path: rel, type: 'symlink', target: readlinkSync(abs) });
-    else if (stat.isDirectory()) { for (const name of readdirSync(abs)) collect(`${rel}/${name}`); }
-    else { total += stat.size; files.push({ path: rel, type: 'file', mode: stat.mode & 0o7777, size: stat.size, sha256: sha256File(abs) }); }
+    else if (stat.isDirectory()) {
+      // 目录也显式入清单(tar -n 不递归):空目录否则进不了归档,实机 R1 实测
+      // 6/40 项因 node_modules 内空目录(.vite-temp)恢复不全等
+      files.push({ path: rel, type: 'dir', mode: stat.mode & 0o7777 });
+      for (const name of readdirSync(abs)) collect(`${rel}/${name}`);
+    } else { total += stat.size; files.push({ path: rel, type: 'file', mode: stat.mode & 0o7777, size: stat.size, sha256: sha256File(abs) }); }
   };
   for (const raw of ignoredPaths) collect(raw.replace(/\/$/, ''));
   if (total > residueMaxBytes) {
@@ -194,7 +198,8 @@ function residueArchive(worktreePath, ignoredPaths, destDir, residueMaxBytes) {
   const listPath = join(destDir, 'residue-list.nul');
   writeFileSync(listPath, files.map((file) => file.path).join('\0'));
   const tarPath = join(destDir, 'residue.tar');
-  execFileSync('tar', ['-c', '-f', tarPath, '-C', worktreePath, '--null', '-T', listPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  // -n(--no-recursion): 清单已显式含每个 dir/file/symlink,防止 dir 递归重复打包
+  execFileSync('tar', ['-c', '-n', '-f', tarPath, '-C', worktreePath, '--null', '-T', listPath], { stdio: ['ignore', 'pipe', 'pipe'] });
   // 实际解包复验:逐文件 hash 全等
   const check = mkdtempSync(join(tmpdir(), 'patrol-residue-check-'));
   try {
@@ -202,6 +207,8 @@ function residueArchive(worktreePath, ignoredPaths, destDir, residueMaxBytes) {
     for (const file of files) {
       if (file.type === 'symlink') {
         if (readlinkSync(join(check, file.path)) !== file.target) throw new Error(`preservation_failed: residue 软链复验不符 ${file.path}`);
+      } else if (file.type === 'dir') {
+        if (!lstatSync(join(check, file.path)).isDirectory()) throw new Error(`preservation_failed: residue 目录复验不符 ${file.path}`);
       } else if (sha256File(join(check, file.path)) !== file.sha256) {
         throw new Error(`preservation_failed: residue hash 复验不符 ${file.path}`);
       }
@@ -381,6 +388,13 @@ export function rehearse({ receiptPath: receiptFile, dest }) {
   for (const argvTemplate of receipt.recoveryArgv) {
     const argv = argvTemplate.map((token) => (token === '{DEST}' ? dest : token));
     execFileSync(argv[0], argv.slice(1), { env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] });
+  }
+  // 从 receipt 自身的 pre-state manifest 补建缺失目录(只消费 receipt 数据,非外部输入):
+  // 兼容旧版 residue 归档不含空目录的 receipt;新版归档已含目录,此步幂等空转。
+  for (const row of receipt.preState.rows) {
+    if (row.type !== 'dir' || row.path === '') continue;
+    const abs = join(dest, row.path);
+    if (!existsSync(abs)) mkdirSync(abs, { recursive: true, mode: row.mode });
   }
   const restored = computeManifest(dest);
   const equal = manifestEqual(restored, receipt.preState) && restored.head === receipt.preState.head;

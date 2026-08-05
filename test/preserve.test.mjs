@@ -99,13 +99,14 @@ describe('preserve E2E(fixture 仓)', () => {
     // ⑤ detached-dirty
     sh(work, GIT_BIN, ['worktree', 'add', '--detach', join(tmp, 'wt-detdirty')]);
     writeFileSync(join(tmp, 'wt-detdirty', 'x.txt'), 'x\n');
-    // ⑥ ignored 三形态:普通/可执行位/软链
+    // ⑥ ignored 四形态:普通/可执行位/软链/空目录(实机 R1 实测 6/40 因空目录恢复不全等)
     sh(work, GIT_BIN, ['worktree', 'add', join(tmp, 'wt-ign'), '-b', 'f-ign']);
     const ign = join(tmp, 'wt-ign');
     writeFileSync(join(ign, 'plain.ign'), 'p\n');
     writeFileSync(join(ign, 'exec.ign'), '#!/bin/sh\n');
     chmodSync(join(ign, 'exec.ign'), 0o755);
     symlinkSync('plain.ign', join(ign, 'link.ign'));
+    mkdirSync(join(ign, 'emptydir.ign'));
     // ⑦ 空格+单引号路径 + dirty
     sh(work, GIT_BIN, ['worktree', 'add', join(tmp, SPACY), '-b', 'f-spacy']);
     writeFileSync(join(tmp, SPACY, 'sp file.txt'), 'sp\n');
@@ -199,7 +200,8 @@ exec "${GIT_BIN}" "$@"
     const ignEntry = entryByPath(after, 'wt-ign');
     const ignReceipt = receiptOf(stateDir, ignEntry.entryId);
     const residuePaths = ignReceipt.artifacts.residueManifest.map((file) => file.path).sort();
-    expect(residuePaths).toEqual(['exec.ign', 'link.ign', 'plain.ign']);
+    expect(residuePaths).toEqual(['emptydir.ign', 'exec.ign', 'link.ign', 'plain.ign']);
+    expect(ignReceipt.artifacts.residueManifest.find((file) => file.path === 'emptydir.ign').type).toBe('dir');
     expect(ignReceipt.artifacts.residueManifest.find((file) => file.path === 'exec.ign').mode & 0o111).toBeTruthy();
     expect(ignReceipt.artifacts.residueManifest.find((file) => file.path === 'link.ign').target).toBe('plain.ign');
 

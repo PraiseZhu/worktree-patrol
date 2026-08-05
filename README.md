@@ -1,69 +1,67 @@
 # worktree-patrol
 
-**本机 git worktree 风险巡检与治理。** 个人机器卫生工具——不是任何项目的代码，因此独立成仓、不寄居在被巡检的项目仓里。
+**本机 git worktree 自动建账 + 自动清理。** 个人机器卫生工具——独立成仓,不寄居在被治理的项目仓里。
 
 ## 它解决什么
 
-多 agent 并行开发（Orca 派工、create-pr、review 轮）会持续产出 git worktree。积累到几十个之后：哪个还有用、哪个能删、哪个删了会丢未提交的活，全靠人肉记。本工具把这件事变成一条命令 + 一个每日定时播报。
+多 agent 并行开发(Orca 派工、create-pr、review 轮)持续产出 git worktree,积累到几十个后没人记得哪个能删。本工具把 cindy 桌面端的治理思路移植到"无主历史存量":**没有台账就机器建账;有账且可证零损失就自动清;建不了账的分毫不动。**
 
-实测规模：单台机器 68 个注册 worktree，其中含 1 个 detached 且有未提交改动（删了永久丢失）、36 个有本地未推送提交。
+实测(2026-08-05 首轮实机):69 个注册项 → 自动清 40(每项恢复演练全等通过)、按证据保留 29、误删 0。
 
-## 两个组件
+## 三条硬原则
 
-| 组件 | 作用 |
+1. **存证优先于判断**:不猜"删了有没有损失",先把每项变成"删了零损失"再删(cindy 模式)。脏内容 stash 成快照 ref、未推送提交打 immutable 归档 ref + bundle、ignored 残渣独立归档,全部复验通过才允许删除层碰它。
+2. **硬保留门独立求 OR**:主仓根(按仓身份非分支名)/`.worktree-keep` 哨兵/locked/在途 PR(分支名或 detached HEAD OID 双通道)/lsof 观察到进程占用/近 T 小时(默认 48h)内有活动且带损失内容——任一命中即保留,收集全部理由不短路。
+3. **fail-closed**:任一探针失败、gh 通道不完整、config 非法、身份漂移 → 一律不删。「不知道」永远不等于「可以删」。
+
+## 组件
+
+| 脚本 | 职责 |
 |---|---|
-| `scripts/repo-worktrees.mjs`(+`-core.mjs`) | 只读巡检器：把每个 worktree 按风险分成 16 类，输出人读表格或 `--json` |
-| `scripts/worktree-patrol.mjs` | 定时调度侧 wrapper：`hook`/`report`/`ack` 三子命令，配合 Cindy scheduler 做「有变化才提醒」 |
+| `scripts/ledger-bootstrap.mjs`(+`ledger-core.mjs`) | 建账器:冻结 cohort(porcelain 原文+hash+run_id)→ 逐项探针(身份/损失清单/活动时间/PR/哨兵)→ 判决式台账(`state/ledger.json`,O_EXCL 锁 + 原子写,幂等) |
+| `scripts/preserve.mjs` | 存证与恢复原语(**永不删除**):归档 ref(expected-old=zero 不可覆盖)/bundle(verify+list-heads+隔离空仓 fetch 复验)/stash 快照(唯一 marker,失败 apply --index 回滚)/残渣 tar(-n 显式清单含空目录,解包逐 hash 复验)。产出一次写入的 receipt + 结构化 recoveryArgv。`rehearse` 子命令按 recoveryArgv 实际恢复并逐字段全等校验 |
+| `scripts/reclaim.mjs` | 删除器:只消费「schema-valid + config/source hash 匹配 + receipt 复读逐 artifact 重验」的项;身份重验×2 + 末刻重验(HEAD/status/哨兵/locked/PR/lsof);durable removing intent 先落账;唯一破坏动作 `git worktree remove` **无 --force**;四象限处置;分支永不删 |
+| `scripts/worktree-patrol.mjs` | 调度链:`hook`(纯只读判定,零写)→ `report`(建账→存证→回收→post-reclaim 复采→写 pending+通知文本)→ `ack`(绑定 run_id+registry hash+台账 hash,漂移即拒) |
+| `scripts/repo-worktrees.mjs`(+core) | 只读巡检器(16 分类风险报告,独立可用):`npm run repo:worktrees` |
 
-## 用法
+## 每天 06:00 发生什么
 
-```bash
-npm run repo:worktrees                      # 人读表格
-npm run -s repo:worktrees -- --json         # 机读(必须带 -s,否则 npm banner 污染 stdout)
-npm run repo:worktrees -- --base <ref>      # 换合入判定基线(默认 origin/main)
+```
+hook(零 token 判定) ── 无变化且无到期项 → exit 2,直接睡
+   │ pending 未确认 / 首轮 / source|config 指纹变化 / registry 变化 / 48h 保护窗到期
+   ▼
+report:建账 → 存证(全部复验) → 回收(重验×3) → 复采 → 通知四分区
+   已清 N(恢复台账路径) / 保留 M(逐条理由) / 建不了账 K(探针原因) / 失败·漂移·冲突 F
+   │ F>0 或通知失败 → 不 ack,pending 保留,次轮必重报
+   ▼
+ack:registry/台账 hash 仍与 run 结束时一致才晋升基线
 ```
 
-被巡检的目标仓默认是 `Project MivoCanvas`，用 `WORKTREE_PATROL_TARGET_REPO=/path/to/repo` 覆盖。
+## 恢复(每个已清项都有可粘贴命令)
 
-## 分类与唯一的删除信号
+receipt 在 `state/receipts/<entryId>.json`,含 `recoveryText`:
+```
+DEST=<目标目录>; git -C <repo> worktree add --detach "$DEST" <head> && git -C "$DEST" stash apply --index <sha> && tar -x -f <residue.tar> -C "$DEST"
+```
+首轮实机 40/40 按此演练恢复,与删除前逐字段(类型/mode/size/sha256/软链目标/index 状态)全等。
 
-16 个固定分类按风险排序（另有动态 `PR <state>` 族）。**`removable: true` 是唯一允许自动化删除流程消费的信号**，要求全部成立：HEAD 是基线祖先 + 工作区干净 + 无在途 PR + 无 `.worktree-keep` 哨兵 + 未 locked + 全部探针成功 + PR 查询通道完整。
+## 明确不做
 
-其余一律 `false`，包括这些容易被误当"可删"的：
+- **不删分支、不 prune、不 unlock、无远端写**(分支清理走 cleanup-branch 人工路径)
+- 嵌套 git 仓 / 脏 submodule:v1 无等价归档 → unledgerable,零动作
+- 目录已消失的注册残根:v1 零 prune,只报告
 
-- `detached dirty danger` —— 最危险：无分支且有未提交改动
-- `local unpushed feature` —— 有未 push 的提交，删了丢活
-- `clean merged (unverified PR)` / `clean merged (PR head 未绑定)` —— PR 通道不完整或 PR head 与本地 HEAD 不匹配，不敢授权
-- `keep sentinel` —— 人工放了 `.worktree-keep`，任何模式都不穿透
-- `prunable (path gone)` / `missing (unknown state)` —— 目录已消失，处置动作是 `git worktree prune` 而非分支清理
+## 配置
 
-**本工具只出报告，永不删任何东西。** 清理走 `cleanup-branch` skill 的 guard（独立重验 + TOCTOU），不以本报告为授权。
-
-## fail-closed 设计
-
-宁可少报可删项，不可误授权删除。两类不完整分开表达，不混为一谈：
-
-- `prLookup.status=degraded` —— 在途 PR 不可信（gh 不可用/超时/坏 JSON/坏行/**open 查询被 limit 截断**/无法解析 origin 仓名）。此时 `removable` 全部归零。
-- `prLookup.historyTruncated=true` —— 仅历史 PR 终态（`--state all`）被 limit 截断，属信息性字段不全，**不影响 `removable`**。PR 总数超 200 的仓这是稳态常见值，不是故障。
-
-探针定位隔离：`git` 侧清除 `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_CONFIG_*` 等定位与配置变量，`gh` 侧清除 `GH_REPO` 并显式传 `--repo`（从 origin URL 解析）。否则外部环境变量能把探针静默改指到另一个仓，报出别人的状态却标 `complete=true`。
-
-只读承诺：只调 `rev-parse`/`worktree list`/`status`/`rev-list`/`merge-base`/`log`/`remote get-url` 与 `gh pr list`，全程 `GIT_OPTIONAL_LOCKS=0`。测试用 fake git 逐条断言调用清单，并比对运行前后仓库状态全等。
-
-## 定时巡检
-
-`worktree-patrol.mjs` 配合 Cindy scheduler（每日 06:00 Asia/Shanghai）：
-
-- `hook`（preRunHook）：纯只读判定要不要跑。`exit 2` = 与已确认基线一致 → 跳过、零 token 不起 agent；`exit 0` = 有新情况 → 起 agent；`exit 1` = 采集失败 → run failed 可见。**hook 永不写文件**，所以 scheduler 的 self-test 天然零副作用。
-- `report`：重新采集、打印聚合摘要（不倾倒全部绝对路径）、原子写 pending。
-- `ack --pending <id>`：通知**成功送达后**才把 pending 晋升为基线。没送成就不 ack，下轮继续报。
-
-只报"新坏状态"：新增高危、风险升级、脏度上升、新增可删/prunable、受保护项意外消失。同一个已确认状态不重复刷屏。
+`config/patrol.config.json`:`thresholdHours`(默认 48,0 合法)/`allowedRoots`(白名单外零授权)/`residueMaxBytes`/`lsofBin`/`lsofTimeoutMs`。config 非法 → 整轮拒绝 reclaim。
 
 ## 测试
 
 ```bash
-npm install && npm test
+npm install && npm test   # 104 用例
 ```
+覆盖:分类矩阵与策略矩阵(含反向变异/组合门/边界 T)、真 fixture 仓 E2E(零写 argv 级断言、幂等、并发锁、gh 仓级故障、真 lsof 真进程、deferred-next-run)、存证全形态演练全等 + 五路故障注入回滚、删除器三窗口 TOCTOU/四象限/崩溃收敛/hostile env/台账伪造拒绝、调度链四分区/ack 绑定/指纹触发。
 
-41 个用例：纯函数分类矩阵（含 fail-closed 全场景与反向变异）+ 真实 fixture 仓端到端（集合全等、零写断言、gh 五种降级态、参数 fail-closed、env 劫持防护）。
+## 共识记录
+
+方案经 gpt-5.6-sol 对抗审核达成共识(2026-08-05,AMEND 全盘采用 + 阈值 48h、lsof 三态两参数 ACK),SC 全文见 `~/.claude/.goal/worktree-patrol-autoclean.md`。与 ACK 文本的唯一实测偏差已注记于 `live-probe.mjs`(真实 lsof 的 exit 1+p 记录 = observed-live,方向只更保守)。
