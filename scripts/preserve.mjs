@@ -245,8 +245,8 @@ function writeReceiptOnce(entryId, receipt) {
   try { writeSync(fd, `${JSON.stringify(canonicalize(receipt), null, 2)}\n`); } finally { closeSync(fd); }
 }
 
-/** preserve 前的守门重验(P0-C SC5):sentinel/locked/live/OPEN-PR/身份,任一命中即 skip。 */
-function preflightGuards(entry, repoRoot, config) {
+/** preserve/reclaim 共用的守门重验(P0-C SC5):sentinel/locked/live/身份漂移,任一命中即 skip。 */
+export function preflightGuards(entry, repoRoot, config) {
   const worktreePath = entry.evidence.literalPath;
   try {
     const real = realpathSync(worktreePath);
