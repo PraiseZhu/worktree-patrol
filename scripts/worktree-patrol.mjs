@@ -1,200 +1,228 @@
 #!/usr/bin/env node
-// worktree-patrol — 目标仓 git worktree 每日巡检的调度侧 wrapper。
-// 与 cindy_scheduler 的分工:
-//   hook 子命令   = preRunHook:纯只读判定「本轮要不要跑」。exit 0=有事(起 agent)、
-//                   exit 2=无变化(skip,零 token)、exit 1=采集失败(run failed 可见)。
-//                   hook **永不写任何文件**——scheduler 的 self-test 因此天然零写。
-//   report 子命令 = agent 轮执行:重新采集、打印人读摘要(聚合计数,不倾倒全部绝对路径)、
-//                   原子写 pending 记录;agent 拿摘要调 schedule_notify_current_run,
-//                   通知成功后才允许 ack。
-//   ack 子命令    = 把 pending 晋升为 last-good 基线。通知没送成就不 ack,
-//                   下一轮 hook 会继续 exit 0 重报(pending 未确认不静默)。
+// worktree-patrol — 每日巡检+自动清理的调度侧编排(P1-D 共识版)。
+// 链路: hook(只读判定) → report(bootstrap→preserve→reclaim→复采→写 pending+通知文本)
+//       → [scheduler agent 发通知] → ack(校验绑定后晋升基线)。
 //
-// 巡检器与本 wrapper 同仓(scripts/repo-worktrees.mjs),不再有跨仓 fallback 链——
-// 工具是本机个人卫生工具,不寄居在被巡检的项目仓里。被巡检目标仓由 TARGET_REPO
-// 指定(默认 mivo),可用 WORKTREE_PATROL_TARGET_REPO 覆盖。
-// 状态唯一落点: <本仓>/state/state.json(tmp+rename 原子写,同目录 lock;已 gitignore)。
-// 对 git 零写:采集走 repo-worktrees.mjs(只读契约,GIT_OPTIONAL_LOCKS=0),本脚本只写 state 目录。
+// 与旧版(只报告)的关键差异:
+//   - report 现在是完整清理链;pending.snapshot 是 **post-reclaim** 复采结果——
+//     pre-reclaim 快照只是 intention,绝不晋升基线(D SC1)。
+//   - 通知四分区互斥并集 == 冻结 cohort,计数由台账逐项重算,不信调用方传数(D SC2)。
+//   - 任何 failed/stale/conflict → pending.ok=false → ack 拒绝 → 次轮 hook 必 exit 0
+//     重试(即使 registry 字节不变,D SC3)。
+//   - hook 触发面: pending 未确认 / 首轮 / source|config 指纹变化 / registry hash 变化 /
+//     policy deadline(activityAt+T)到期。全程零写(D SC4/SC5)。
 
-import { execFileSync } from 'node:child_process';
 import {
   existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { sha256, canonicalize } from './ledger-core.mjs';
+import { git } from './repo-worktrees.mjs';
+import {
+  STATE_DIR, bootstrap, computeSourceHash, loadConfig, readLedger,
+} from './ledger-bootstrap.mjs';
+import { preserveAll } from './preserve.mjs';
+import { reclaimAll } from './reclaim.mjs';
 
-// 本仓根(scripts/ 的上一级);巡检器固定取本仓 scripts/repo-worktrees.mjs
 const TOOL_ROOT = join(import.meta.dirname, '..');
-// 被巡检的目标仓(worktree registry 属于它)
 const MAIN_REPO = process.env.WORKTREE_PATROL_TARGET_REPO || '/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas';
-const STATE_DIR = process.env.WORKTREE_PATROL_STATE_DIR || join(TOOL_ROOT, 'state');
-const STATE_PATH = join(STATE_DIR, 'state.json');
-const LOCK_PATH = join(STATE_DIR, 'state.lock');
-const SCHEMA_VERSION = 1;
+const CONFIG_PATH = process.env.WORKTREE_PATROL_CONFIG || join(TOOL_ROOT, 'config', 'patrol.config.json');
+const STATE_SCHEMA_VERSION = 2;
 
-// 风险语义(与 repo-worktrees-core 的分类字符串绑定)
-const DANGER = new Set(['detached dirty danger', 'missing (unknown state)', 'unknown (probe failed)', 'HEAD merged, worktree dirty', 'dirty WIP']);
-const PROTECTED = new Set(['active PR', 'dirty WIP', 'local unpushed feature', 'main clean']);
-
-function sha256(text) { return createHash('sha256').update(text).digest('hex'); }
-
-// 巡检器只有一个来源(同仓 scripts/);缺文件或接口不过 → 返回 null,调用方 fail-visible。
-// 不做多来源猜测:猜错来源等于用未知版本的判定逻辑出报告。
-function resolveInspector() {
-  const cli = join(TOOL_ROOT, 'scripts/repo-worktrees.mjs');
-  const core = join(TOOL_ROOT, 'scripts/repo-worktrees-core.mjs');
-  if (!existsSync(cli) || !existsSync(core)) {
-    process.stderr.write(`[patrol] 巡检器缺失: ${cli}\n`);
-    return null;
-  }
-  try {
-    const out = execFileSync(process.execPath, [cli, '--json'], {
-      cwd: MAIN_REPO, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const report = JSON.parse(out);
-    if (!Array.isArray(report.rows)) throw new Error('rows 不是数组');
-    return {
-      report,
-      source: { tag: 'worktree-patrol', cli, cliSha256: sha256(readFileSync(cli, 'utf8')), coreSha256: sha256(readFileSync(core, 'utf8')) },
-    };
-  } catch (error) {
-    process.stderr.write(`[patrol] 巡检器执行失败: ${String(error.message).slice(0, 200)}\n`);
-    return null;
-  }
-}
-
-// 采集并做完整性裁决:任何不完整都算失败(fail-visible),不许在残缺数据上做静默判定。
-function collect() {
-  const resolved = resolveInspector();
-  if (!resolved) throw new Error('巡检器不可用(见上方 stderr)');
-  const { report, source } = resolved;
-  if (report.prLookup?.status !== 'ok') throw new Error(`prLookup=${report.prLookup?.status}(${report.prLookup?.reason})——PR 完整性缺失,本轮记 failed 不推进基线`);
-  if (!report.commonDir?.startsWith(MAIN_REPO)) throw new Error(`commonDir 不符: ${report.commonDir}`);
-  const perPath = {};
-  for (const row of report.rows) {
-    if (!row.path || !row.classification) throw new Error('存在缺 path/classification 的行');
-    if (perPath[row.path]) throw new Error(`重复 path: ${row.path}`);
-    if (!row.prunable && !row.missing && !row.complete) throw new Error(`row 不完整: ${row.path}`);
-    perPath[row.path] = {
-      classification: row.classification,
-      dirty: row.dirty, untracked: row.untracked,
-      removable: row.removable, prunable: row.prunable,
-      branch: row.branch,
-    };
-  }
-  const canonical = JSON.stringify(perPath);
-  return { perPath, reportHash: sha256(canonical), generatedAt: report.generatedAt, host: hostname(), source };
-}
-
-// 与基线比较,产出「新坏状态」增量(同一已确认状态不重复报——安静规则)。
-function diffAgainst(baseline, current) {
-  const alerts = [];
-  const base = baseline?.perPath ?? null;
-  if (!base) {
-    const counts = countBy(current.perPath);
-    alerts.push(`首次基线: ${Object.keys(current.perPath).length} 个注册项(${counts})`);
-    return alerts;
-  }
-  for (const [path, now] of Object.entries(current.perPath)) {
-    const prev = base[path];
-    const short = path.split('/').slice(-1)[0];
-    if (!prev) {
-      if (DANGER.has(now.classification)) alerts.push(`新增高危: ${short} → ${now.classification}`);
-      else if (now.removable) alerts.push(`新增可删项: ${short}`);
-      else if (now.prunable) alerts.push(`新增 prunable: ${short}`);
-      continue;
-    }
-    if (!DANGER.has(prev.classification) && DANGER.has(now.classification)) {
-      alerts.push(`风险升级: ${short} ${prev.classification} → ${now.classification}`);
-    } else if (DANGER.has(now.classification) && (now.dirty > prev.dirty || now.untracked > prev.untracked)) {
-      alerts.push(`脏度上升: ${short} dirty ${prev.dirty}→${now.dirty}`);
-    }
-    if (!prev.removable && now.removable) alerts.push(`转入可删: ${short}`);
-    if (!prev.prunable && now.prunable) alerts.push(`转入 prunable: ${short}`);
-  }
-  for (const [path, prev] of Object.entries(base)) {
-    if (!current.perPath[path] && PROTECTED.has(prev.classification)) {
-      alerts.push(`受保护项消失: ${path.split('/').slice(-1)[0]}(原 ${prev.classification})——非本巡检授权的删除,请核`);
-    }
-  }
-  return alerts;
-}
-
-function countBy(perPath) {
-  const counts = {};
-  for (const row of Object.values(perPath)) counts[row.classification] = (counts[row.classification] ?? 0) + 1;
-  return Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(', ');
-}
+const statePath = () => join(STATE_DIR(), 'state.json');
+const nowMs = () => Number(process.env.PATROL_NOW_MS || Date.now());
 
 function readState() {
-  if (!existsSync(STATE_PATH)) return { schemaVersion: SCHEMA_VERSION, lastGood: null, pending: null };
-  const state = JSON.parse(readFileSync(STATE_PATH, 'utf8'));
-  if (state.schemaVersion !== SCHEMA_VERSION) throw new Error(`state schemaVersion 不符: ${state.schemaVersion}`);
+  if (!existsSync(statePath())) return { schemaVersion: STATE_SCHEMA_VERSION, lastGood: null, pending: null };
+  const state = JSON.parse(readFileSync(statePath(), 'utf8'));
+  if (state.schemaVersion !== STATE_SCHEMA_VERSION) {
+    // v1(只报告时代)基线与 v2 语义不兼容:按无基线处理,首轮全量重建(不静默丢 pending 之外的信息)
+    return { schemaVersion: STATE_SCHEMA_VERSION, lastGood: null, pending: null, migratedFrom: state.schemaVersion };
+  }
   return state;
 }
 
 function writeStateAtomic(state) {
-  mkdirSync(STATE_DIR, { recursive: true });
-  if (existsSync(LOCK_PATH)) {
-    const age = Date.now() - Number(readFileSync(LOCK_PATH, 'utf8') || 0);
-    if (age < 10 * 60 * 1000) throw new Error('state.lock 被占用(并发实例?),本轮放弃写入');
-  }
-  writeFileSync(LOCK_PATH, String(Date.now()));
-  try {
-    const tmp = `${STATE_PATH}.tmp-${process.pid}`;
-    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
-    renameSync(tmp, STATE_PATH);
-  } finally {
-    rmSync(LOCK_PATH, { force: true });
-  }
+  mkdirSync(STATE_DIR(), { recursive: true });
+  const tmp = `${statePath()}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(canonicalize(state), null, 2)}\n`);
+  renameSync(tmp, statePath());
 }
+
+function porcelainHashOf(repo) {
+  return sha256(git(['worktree', 'list', '--porcelain'], { cwd: repo }));
+}
+
+function ledgerHashOf() {
+  const path = join(STATE_DIR(), 'ledger.json');
+  return existsSync(path) ? sha256(readFileSync(path, 'utf8')) : 'absent';
+}
+
+// 台账 → 四分区(互斥;并集必须 == 本轮 cohort,D SC2)
+const PARTITION_OF = (entry) => {
+  if (entry.disposition === 'keep') return 'keep';
+  if (entry.disposition === 'unledgerable') return 'unledgerable';
+  // disposition === 'reclaim'
+  if (entry.lifecycle === 'reclaimed') return 'reclaimed';
+  return 'failed'; // preserve-failed / reclaim-failed / stale / conflict / 半途 lifecycle
+};
+
+function partition(cohortEntryIds, ledger) {
+  const parts = { reclaimed: [], keep: [], unledgerable: [], failed: [] };
+  const missing = [];
+  for (const entryId of cohortEntryIds) {
+    const entry = ledger.entries[entryId];
+    if (!entry) { missing.push(entryId); continue; }
+    parts[PARTITION_OF(entry)].push({
+      entryId,
+      path: entry.evidence.literalPath,
+      lifecycle: entry.lifecycle,
+      reasons: entry.reasons,
+      lastError: entry.lastError ?? null,
+      receiptPath: entry.receiptPath ?? null,
+      deadlineMs: entry.deadlineMs ?? null,
+      runId: entry.runId,
+    });
+  }
+  return { parts, missing };
+}
+
+function renderNotify({ runId, host, parts, cohortSize, deferredNextRun, alerts, ok }) {
+  const lines = [];
+  lines.push(`[worktree 巡检+清理 @${host}] run=${runId} cohort=${cohortSize} ${ok ? '' : '⚠️ 本轮有失败项'}`.trim());
+  lines.push(`已清 ${parts.reclaimed.length} / 保留 ${parts.keep.length} / 建不了账 ${parts.unledgerable.length} / 失败·漂移·冲突 ${parts.failed.length}`);
+  if (parts.reclaimed.length > 0) {
+    lines.push(`— 已清(存证+恢复指引见 receipts):`);
+    for (const item of parts.reclaimed.slice(0, 10)) lines.push(`  · ${short(item.path)}${item.receiptPath ? '' : '(crash-reconciled)'}`);
+    if (parts.reclaimed.length > 10) lines.push(`  · …另 ${parts.reclaimed.length - 10} 项`);
+    lines.push(`  恢复台账: ${join(STATE_DIR(), 'receipts')}/`);
+  }
+  if (parts.keep.length > 0) {
+    lines.push(`— 保留(逐条理由):`);
+    for (const item of parts.keep.slice(0, 12)) lines.push(`  · ${short(item.path)}: ${item.reasons[0]}`);
+    if (parts.keep.length > 12) lines.push(`  · …另 ${parts.keep.length - 12} 项`);
+  }
+  if (parts.unledgerable.length > 0) {
+    lines.push(`— 建不了账(零动作,逐条探针原因):`);
+    for (const item of parts.unledgerable.slice(0, 8)) lines.push(`  · ${short(item.path)}: ${item.reasons[0]}`);
+    if (parts.unledgerable.length > 8) lines.push(`  · …另 ${parts.unledgerable.length - 8} 项`);
+  }
+  if (parts.failed.length > 0) {
+    lines.push(`— 失败/漂移/冲突(需人看,恢复指引在台账 lastError):`);
+    for (const item of parts.failed) lines.push(`  · ${short(item.path)} [${item.lifecycle}] ${item.lastError ?? ''}`);
+  }
+  if (deferredNextRun.length > 0) lines.push(`— 运行中新增 ${deferredNextRun.length} 项,顺延下轮`);
+  for (const alert of alerts) lines.push(`‼️ ${alert}`);
+  return lines.join('\n');
+}
+
+const short = (path) => path.split('/').slice(-2).join('/');
 
 function main() {
   const cmd = process.argv[2];
+
   if (cmd === 'hook') {
-    // 纯只读:任何路径都不写文件。
+    // 纯只读判定,任何路径零写(D SC4)
     let state;
     try { state = readState(); } catch (error) { console.error(`[patrol] state 损坏: ${error.message}`); process.exit(1); }
-    let current;
-    try { current = collect(); } catch (error) { console.error(`[patrol] 采集失败: ${error.message}`); process.exit(1); }
     if (state.pending) { console.error('[patrol] 存在未确认 pending,继续报'); process.exit(0); }
-    const alerts = diffAgainst(state.lastGood, current);
-    if (alerts.length > 0) { console.error(`[patrol] ${alerts.length} 条新情况`); process.exit(0); }
-    console.error('[patrol] 与已确认基线一致,本轮跳过');
-    process.exit(2);
-  } else if (cmd === 'report') {
-    const state = readState();
-    const current = collect();
-    const alerts = state.pending ? [...state.pending.alerts] : diffAgainst(state.lastGood, current);
-    const pending = {
-      id: `p-${Date.now().toString(36)}`,
-      createdAt: new Date().toISOString(),
-      reportHash: current.reportHash,
-      alerts,
-      snapshot: { perPath: current.perPath, generatedAt: current.generatedAt, source: current.source, host: current.host },
-    };
-    writeStateAtomic({ ...state, pending });
-    console.log(`PENDING_ID=${pending.id}`);
-    console.log(`[mivo worktree 巡检 @${current.host}] 来源=${current.source.tag} 注册项=${Object.keys(current.perPath).length}`);
-    for (const alert of alerts.slice(0, 8)) console.log(`- ${alert}`);
-    if (alerts.length > 8) console.log(`- …另 ${alerts.length - 8} 条,详见 state.json`);
-  } else if (cmd === 'ack') {
-    const idFlag = process.argv[process.argv.indexOf('--pending') + 1];
-    const state = readState();
-    if (!state.pending) { console.error('无 pending 可确认'); process.exit(1); }
-    if (state.pending.id !== idFlag) { console.error(`pending id 不符: 现存 ${state.pending.id}`); process.exit(1); }
-    writeStateAtomic({
-      schemaVersion: SCHEMA_VERSION,
-      lastGood: { perPath: state.pending.snapshot.perPath, reportHash: state.pending.reportHash, generatedAt: state.pending.snapshot.generatedAt, source: state.pending.snapshot.source, ackedAt: new Date().toISOString() },
-      pending: null,
-    });
-    console.log(`已确认基线 ${state.pending.reportHash.slice(0, 12)}`);
-  } else {
-    console.error('用法: worktree-patrol.mjs hook|report|ack --pending <id>');
+    if (!state.lastGood) { console.error('[patrol] 无基线,首轮'); process.exit(0); }
+    let config;
+    try { config = loadConfig(CONFIG_PATH); } catch (error) { console.error(`[patrol] config 异常: ${error.message}`); process.exit(1); }
+    if (config.configHash !== state.lastGood.configHash) { console.error('[patrol] config 指纹变化,重新裁决'); process.exit(0); }
+    if (computeSourceHash() !== state.lastGood.sourceHash) { console.error('[patrol] 判定源码指纹变化,重新裁决'); process.exit(0); }
+    let registryHash;
+    try { registryHash = porcelainHashOf(MAIN_REPO); } catch (error) { console.error(`[patrol] 采集失败: ${error.message}`); process.exit(1); }
+    if (registryHash !== state.lastGood.postHash) { console.error('[patrol] registry 有变化'); process.exit(0); }
+    const deadline = state.lastGood.minDeadlineMs;
+    if (typeof deadline === 'number' && nowMs() >= deadline) { console.error('[patrol] recent-loss 保护窗到期,重新裁决'); process.exit(0); }
+    console.error('[patrol] 与已确认基线一致且无到期项,本轮跳过');
     process.exit(2);
   }
+
+  if (cmd === 'report') {
+    const alerts = [];
+    let ok = true;
+    // ① 建账(冻结 cohort)
+    const boot = bootstrap({ repoDir: MAIN_REPO, configPath: CONFIG_PATH });
+    const cohortEntryIds = Object.keys(boot.entries);
+    // ② 存证 ③ 回收(单项失败不阻断,函数内部逐项 catch)
+    const preserved = preserveAll({ repoDir: MAIN_REPO, configPath: CONFIG_PATH, opId: boot.runId });
+    if (!preserved.ok) ok = false;
+    const reclaimed = reclaimAll({ repoDir: MAIN_REPO, configPath: CONFIG_PATH });
+    if (!reclaimed.ok) ok = false;
+    // ④ post-reclaim 复采(pending.snapshot 的唯一合法来源,D SC1)
+    const postHash = porcelainHashOf(MAIN_REPO);
+    const ledger = readLedger();
+    const { parts, missing } = partition(cohortEntryIds, ledger);
+    if (missing.length > 0) { ok = false; alerts.push(`台账缺 ${missing.length} 个 cohort 项(分区并集破缺)`); }
+    const unionSize = parts.reclaimed.length + parts.keep.length + parts.unledgerable.length + parts.failed.length;
+    if (unionSize + missing.length !== cohortEntryIds.length) { ok = false; alerts.push('四分区并集 != cohort(互斥性破缺)'); }
+    // ⑤ 受保护项消失检测:上一基线的 keep/unledgerable 路径,若本轮 cohort 缺失且
+    //    不是本工具台账登记的 reclaimed(按 run 历史豁免)→ 报警(D SC5)
+    const state = readState();
+    if (state.lastGood) {
+      const cohortPaths = new Set(Object.values(boot.entries).map((entry) => entry.evidence.literalPath));
+      const reclaimedPaths = new Set(Object.values(ledger.entries).filter((entry) => entry.lifecycle === 'reclaimed').map((entry) => entry.evidence.literalPath));
+      for (const item of [...(state.lastGood.parts?.keep ?? []), ...(state.lastGood.parts?.unledgerable ?? [])]) {
+        if (!cohortPaths.has(item.path) && !reclaimedPaths.has(item.path)) {
+          alerts.push(`受保护项消失: ${short(item.path)}(原 ${item.reasons?.[0] ?? '?'})——非本巡检授权的删除,请核`);
+        }
+      }
+    }
+    const minDeadlineMs = Math.min(...parts.keep.map((item) => item.deadlineMs ?? Infinity));
+    const pending = {
+      id: `p-${boot.runId}`,
+      runId: boot.runId,
+      cohortHash: boot.cohortHash,
+      postHash,
+      ledgerHash: ledgerHashOf(),
+      sourceHash: boot.sourceHash,
+      configHash: boot.config.configHash,
+      minDeadlineMs: Number.isFinite(minDeadlineMs) ? minDeadlineMs : null,
+      parts, ok,
+      deferredNextRun: boot.deferredNextRun,
+      alerts,
+      createdAt: new Date(nowMs()).toISOString(),
+    };
+    writeStateAtomic({ ...readState(), schemaVersion: STATE_SCHEMA_VERSION, pending });
+    console.log(`PENDING_ID=${pending.id}`);
+    console.log(renderNotify({ runId: boot.runId, host: hostname(), parts, cohortSize: cohortEntryIds.length, deferredNextRun: boot.deferredNextRun, alerts, ok }));
+    process.exit(ok ? 0 : 1);
+  }
+
+  if (cmd === 'ack') {
+    const pendingId = process.argv[process.argv.indexOf('--pending') + 1];
+    const state = readState();
+    if (!state.pending) { console.error('无 pending 可确认'); process.exit(1); }
+    if (state.pending.id !== pendingId) { console.error(`pending id 不符: 现存 ${state.pending.id}`); process.exit(1); }
+    if (!state.pending.ok) { console.error('本轮含 failed/stale/conflict,拒绝晋升基线(次轮重试)'); process.exit(1); }
+    // 绑定校验:ack 时刻的 registry 与台账必须仍是 run 结束时的形态(D SC1)
+    const registryHash = porcelainHashOf(MAIN_REPO);
+    if (registryHash !== state.pending.postHash) { console.error('registry 已漂移,pending 过期,拒绝 ack'); process.exit(1); }
+    if (ledgerHashOf() !== state.pending.ledgerHash) { console.error('台账已漂移,pending 过期,拒绝 ack'); process.exit(1); }
+    writeStateAtomic({
+      schemaVersion: STATE_SCHEMA_VERSION,
+      lastGood: {
+        runId: state.pending.runId,
+        postHash: state.pending.postHash,
+        ledgerHash: state.pending.ledgerHash,
+        sourceHash: state.pending.sourceHash,
+        configHash: state.pending.configHash,
+        minDeadlineMs: state.pending.minDeadlineMs,
+        parts: state.pending.parts,
+        ackedAt: new Date(nowMs()).toISOString(),
+      },
+      pending: null,
+    });
+    console.log(`已确认基线 run=${state.pending.runId}`);
+    process.exit(0);
+  }
+
+  console.error('用法: worktree-patrol.mjs hook | report | ack --pending <id>');
+  process.exit(2);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
