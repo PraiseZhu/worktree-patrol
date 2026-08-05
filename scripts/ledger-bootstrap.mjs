@@ -138,10 +138,21 @@ function probeLoss(worktreePath) {
 function maxMtimeOfPaths(worktreePath, paths) {
   let max = -Infinity;
   let budget = LOSS_PATH_MTIME_WALK_BUDGET;
+  let probed = 0;
   const walk = (abs) => {
     if (budget <= 0) throw new Error('mtime 走查超预算');
     budget -= 1;
-    const stat = lstatSync(abs);
+    let stat;
+    try {
+      stat = lstatSync(abs);
+    } catch (error) {
+      // 删除类损失(worktree 侧 delete)在 status 里有路径但磁盘上已无实体——
+      // ENOENT 不是探针故障,该路径没有 mtime 可测(删除时点由父目录/root mtime 承载),
+      // 跳过;其余错误(权限等)仍 fail-closed。
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    probed += 1;
     if (stat.mtimeMs > max) max = stat.mtimeMs;
     if (stat.isDirectory()) {
       for (const name of readdirSync(abs)) walk(join(abs, name));
@@ -152,7 +163,7 @@ function maxMtimeOfPaths(worktreePath, paths) {
   } catch (error) {
     return { error: `loss 路径 mtime 探测失败: ${String(error?.message ?? error).slice(0, 160)}` };
   }
-  return { maxMtimeMs: paths.length === 0 ? null : max };
+  return { maxMtimeMs: probed === 0 ? null : max, probed };
 }
 
 function prSummaryHasOpenPr(prSummary, evidence) {
@@ -265,7 +276,8 @@ function probeEntry(entry, context) {
       headCommitMs,
       rootMtimeMs: stat.mtimeMs ?? null,
       lossPathsMaxMtimeMs: mtimeProbe.maxMtimeMs,
-      lossPathsProbed: lossProbe.paths.length > 0 && !hardKeepCertain && !mtimeProbe.error,
+      // probed=0(全部损失路径都是删除类)时无 mtime 可贡献,按未探处理
+      lossPathsProbed: (mtimeProbe.probed ?? 0) > 0 && !hardKeepCertain && !mtimeProbe.error,
     });
     if (activity.error) {
       probeErrors.push(activity.error);
