@@ -1,7 +1,6 @@
 {
   "thresholdHours": 48,
   "allowedRoots": [
-    "/private/tmp",
     "/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/.claude/worktrees",
     "/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/.worktrees",
     "/Users/praise/AI-Agent/Claude/projects/Project Mivo Canvas-Plugin/.worktrees"
